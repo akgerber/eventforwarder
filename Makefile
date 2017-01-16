@@ -1,7 +1,7 @@
 default: build
 
 build:
-	go build *.go
+	go build -o main *.go 
 
 test: 
 	go test

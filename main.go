@@ -7,56 +7,24 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
+	host           = "localhost"
 	eventSrcPort   = ":9090"
 	userClientPort = ":9099"
 	bufferSize     = 0
 )
 
 var (
-	done  chan bool = make(chan bool)
-	debug           = false
+	debug = false
 )
-
-//Main server function:
-//-Accept a single event source connection
-//-Accept many user client connections afterward
-func main() {
-	//Handle a single event source connection
-	eventSrc, err := net.Listen("tcp", eventSrcPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	eventsConn, err := eventSrc.Accept()
-	if err != nil {
-		log.Println(err)
-	}
-	go handleEventStream(eventsConn)
-
-	//Handle client connections
-	userClients, err := net.Listen("tcp", userClientPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for {
-		select {
-		case <-done:
-			break
-		default:
-			clientConn, err := userClients.Accept()
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-			go handleClient(clientConn)
-		}
-	}
-}
 
 //Map of client IDs to ProtocolEvent channels
 var userChans = struct {
@@ -70,6 +38,15 @@ func getUserChannel(user int) (userChan chan ProtocolEvent) {
 	userChan = userChans.m[user]
 	userChans.RUnlock()
 	return
+}
+
+//Notify other goroutines and exit
+func finish(eventsDone chan bool) {
+	for _, userId := range getAllClients() {
+		close(getUserChannel(userId))
+	}
+	eventsDone <- true
+	runtime.Goexit()
 }
 
 //If the user-channel hasn't been created yet, create it (threadsafe)
@@ -88,47 +65,48 @@ func makeUserChannel(user int) (userChan chan ProtocolEvent) {
 	return
 }
 
-//Handle a stream of events from a connection-- must be single-threaded to order events
-func handleEventStream(c net.Conn) {
-	var (
-		err             error
-		eventPayload    string
-		lastSequenceNum int       = 0
-		orderedEvents   EventHeap = make(EventHeap, 0)
-	)
-	eventReader := bufio.NewReader(c)
-
-	heap.Init(&orderedEvents)
-
-	for {
-		if eventPayload, err = eventReader.ReadString('\n'); err != nil {
-			if err == io.EOF {
-				log.Printf("Event stream complete. Exiting.")
-				for _, userId := range getAllClients() {
-					close(getUserChannel(userId))
-				}
-				done <- true
-				break
-			} else {
-				log.Fatal(err)
-			}
-		}
-		if event, err := parseEventPayload(strings.TrimSpace(eventPayload)); err != nil {
-			log.Printf("Error parsing event: %s", err)
-		} else {
-			heap.Push(&(orderedEvents), &event)
-			log.Printf("Received event: %d; Previously processed event: %d", event.sequenceNum, lastSequenceNum)
-
-			for len(orderedEvents) > 0 &&
-				orderedEvents[0].sequenceNum == lastSequenceNum+1 {
-				event = *(heap.Pop(&orderedEvents).(*ProtocolEvent))
-				log.Printf("Processing event: %d", event.sequenceNum)
-				handleEvent(event)
-				lastSequenceNum++
-			}
-		}
+//Return a slice of all connected client IDs
+func getAllClients() []int {
+	userChans.RLock()
+	clients := make([]int, 0, len(userChans.m))
+	for user, _ := range userChans.m {
+		clients = append(clients, user)
 	}
-	log.Printf("Event handler exiting")
+	userChans.RUnlock()
+	return clients
+}
+
+//Send a message to all client channels specified in users
+func notifyMany(users []int, event ProtocolEvent) {
+	for _, user := range users {
+		notifyUser(user, event)
+	}
+}
+
+//Send a message to a client channel, or silently ignore it if client doesn't exist
+func notifyUser(userId int, event ProtocolEvent) {
+	toChan := getUserChannel(userId)
+	if toChan != nil {
+		toChan <- event
+	}
+}
+
+//Accept a client connection and receive its UserID
+func getClientUser(c net.Conn) (int, error) {
+	var (
+		clientId int
+		line     string
+		err      error
+	)
+	events := bufio.NewReader(c)
+	if line, err = events.ReadString('\n'); err != nil {
+		return 0, err
+	}
+	if clientId, err = strconv.Atoi(strings.TrimSpace(line)); err != nil {
+		return 0, fmt.Errorf("Channel ID is non-int:  %s", line)
+	} else {
+		return clientId, nil
+	}
 }
 
 //Handle an event as specified-- not threadsafe
@@ -152,56 +130,46 @@ func handleEvent(event ProtocolEvent) {
 	}
 }
 
-//Return a slice of all connected client IDs
-func getAllClients() []int {
-	userChans.RLock()
-	clients := make([]int, 0, len(userChans.m))
-	for user, _ := range userChans.m {
-		clients = append(clients, user)
-	}
-	userChans.RUnlock()
-	log.Printf("Currently connected clients: %#v", clients)
-	return clients
-}
-
-//Send a message to all client channels specified in users
-func notifyMany(users []int, event ProtocolEvent) {
-	for _, user := range users {
-		notifyUser(user, event)
-	}
-}
-
-//Send a message to a client channel, or silently ignore it if client doesn't exist
-func notifyUser(userId int, event ProtocolEvent) {
-	toChan := getUserChannel(userId)
-	if toChan != nil {
-		log.Printf("Notifying user %d of event %#v", userId, event.payload)
-		toChan <- event
-	} else {
-		log.Printf("No client for user %d; ignoring  %#v", userId, event.payload)
-	}
-}
-
-//Accept a client connection and receive its UserID
-func getClientUser(c net.Conn) (int, error) {
+//Handle a stream of events from a connection-- must be single-threaded to order events
+func handleEventStream(c net.Conn, eventsDone chan bool) {
+	defer c.Close()
 	var (
-		clientId int
-		line     string
-		err      error
+		err             error
+		eventPayload    string
+		event           ProtocolEvent
+		lastSequenceNum int       = 0
+		eventBuffer     EventHeap = make(EventHeap, 0)
 	)
-	events := bufio.NewReader(c)
-	if line, err = events.ReadString('\n'); err != nil {
-		return 0, err
-	}
-	if clientId, err = strconv.Atoi(strings.TrimSpace(line)); err != nil {
-		return 0, fmt.Errorf("Channel ID is non-int:  %s", line)
-	} else {
-		return clientId, nil
+	eventReader := bufio.NewReader(c)
+
+	heap.Init(&eventBuffer)
+
+	for {
+		if eventPayload, err = eventReader.ReadString('\n'); err != nil {
+			if err == io.EOF {
+				finish(eventsDone)
+			} else {
+				log.Fatal(err)
+			}
+		}
+		if event, err = parseEventPayload(strings.TrimSpace(eventPayload)); err != nil {
+			log.Fatalf("Error parsing event: %s", err)
+		}
+
+		//process events so long as the next ones in sequenceNum order are available
+		heap.Push(&(eventBuffer), &event)
+		for len(eventBuffer) > 0 &&
+			eventBuffer[0].sequenceNum == lastSequenceNum+1 {
+			event = *(heap.Pop(&eventBuffer).(*ProtocolEvent))
+			handleEvent(event)
+			lastSequenceNum++
+		}
 	}
 }
 
 //Accept connections from a client, create their channels, and pass on notifications
 func handleClient(c net.Conn) {
+	defer c.Close()
 	var (
 		clientId int
 		err      error
@@ -214,8 +182,8 @@ func handleClient(c net.Conn) {
 	eventWriter := bufio.NewWriter(c)
 	log.Printf("Client %d waiting for notifications", clientId)
 
+	//wait for events until channel closes and write them to connection
 	for event := range events {
-		//wait for events on channel and write them to connection
 		log.Printf("Sending %s to client %d", event.payload, clientId)
 		_, err := eventWriter.WriteString(event.ToWire())
 		if err != nil {
@@ -223,5 +191,53 @@ func handleClient(c net.Conn) {
 		}
 		eventWriter.Flush()
 	}
-	log.Printf("Client %d exiting", clientId)
+	runtime.Goexit()
+}
+
+//Main server function:
+//-Accept a single event source connection
+//-Accept many user client connections afterward
+func main() {
+	var (
+		eventSrc, userClients  *net.TCPListener
+		eventsConn, clientConn *net.TCPConn
+		laddr                  *net.TCPAddr
+		eventsDone             chan bool = make(chan bool)
+		err                    error
+	)
+	defer eventSrc.Close()
+	defer userClients.Close()
+	defer os.Exit(0)
+
+	//Handle a single event source connection
+	if laddr, err = net.ResolveTCPAddr("tcp", host+eventSrcPort); err != nil {
+		log.Fatal(err)
+	}
+	if eventSrc, err = net.ListenTCP("tcp", laddr); err != nil {
+		log.Fatal(err)
+	}
+	if eventsConn, err = eventSrc.AcceptTCP(); err != nil {
+		log.Fatal(err)
+	}
+	go handleEventStream(eventsConn, eventsDone)
+
+	//Handle client connections
+	if laddr, err = net.ResolveTCPAddr("tcp", host+userClientPort); err != nil {
+		log.Fatal(err)
+	}
+	if userClients, err = net.ListenTCP("tcp", laddr); err != nil {
+		log.Fatal(err)
+	}
+	userClients.SetDeadline(time.Now().Add(time.Second))
+	for {
+		select {
+		case <-eventsDone:
+			runtime.Goexit()
+		default:
+			if clientConn, err = userClients.AcceptTCP(); err != nil {
+				continue
+			}
+			go handleClient(clientConn)
+		}
+	}
 }
