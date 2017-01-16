@@ -35,11 +35,10 @@ func (event *ProtocolEvent) ToWire() string {
 //An EventHeap is a minheap of pointers to protocol events
 type EventHeap []*ProtocolEvent
 
-func (h EventHeap) Len() int { return len(h) }
-
+//Methods implementing container/heap interface
+func (h EventHeap) Len() int           { return len(h) }
 func (h EventHeap) Less(i, j int) bool { return h[i].sequenceNum < h[j].sequenceNum }
-
-func (h EventHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h EventHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 
 func (h *EventHeap) Push(x interface{}) {
 	*h = append(*h, x.(*ProtocolEvent))

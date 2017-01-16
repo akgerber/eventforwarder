@@ -15,77 +15,61 @@ import (
 	"time"
 )
 
-const (
-	host           = "localhost"
-	eventSrcPort   = ":9090"
-	userClientPort = ":9099"
-	bufferSize     = 0
-)
-
-var (
-	debug = false
-)
-
-//Map of client IDs to ProtocolEvent channels
-var userChans = struct {
-	sync.RWMutex
-	m map[int](chan ProtocolEvent)
-}{m: map[int](chan ProtocolEvent){}}
-
 //Get a channel from the channel map (threadsafe)
-func getUserChannel(user int) (userChan chan ProtocolEvent) {
-	userChans.RLock()
-	userChan = userChans.m[user]
-	userChans.RUnlock()
+func getUserChannel(s Service, user int) (userChan chan ProtocolEvent) {
+	s.userChanLock.RLock()
+	userChan = s.userChans[user]
+	s.userChanLock.RUnlock()
 	return
 }
 
 //Notify other goroutines and exit
-func finish(eventsDone chan bool) {
-	for _, userId := range getAllClients() {
-		close(getUserChannel(userId))
+func finishEvents(s Service) {
+	log.Printf("Exiting-- EOF received from event source")
+	for _, userId := range getAllClients(s) {
+		close(getUserChannel(s, userId))
 	}
-	eventsDone <- true
+	s.eventsDone <- true
 	runtime.Goexit()
 }
 
 //If the user-channel hasn't been created yet, create it (threadsafe)
-func makeUserChannel(user int) (userChan chan ProtocolEvent) {
-	userChan = getUserChannel(user)
+func makeUserChannel(s Service, user int) (userChan chan ProtocolEvent) {
+	const bufferSize = 0
+	userChan = getUserChannel(s, user)
 
 	if userChan == nil {
-		userChans.Lock()
-		log.Printf("Creating channel for client %d", user)
-		if userChans.m[user] == nil { //make sure another thread didn't initialize
-			userChans.m[user] = make(chan ProtocolEvent, bufferSize)
+		s.userChanLock.Lock()
+		if s.userChans[user] == nil { //make sure another thread didn't initialize
+			s.userChans[user] = make(chan ProtocolEvent, bufferSize)
 		}
-		userChan = userChans.m[user]
-		userChans.Unlock()
+		userChan = s.userChans[user]
+		s.userChanLock.Unlock()
 	}
 	return
 }
 
 //Return a slice of all connected client IDs
-func getAllClients() []int {
-	userChans.RLock()
-	clients := make([]int, 0, len(userChans.m))
-	for user, _ := range userChans.m {
+func getAllClients(s Service) []int {
+	s.userChanLock.RLock()
+	clients := make([]int, 0, len(s.userChans))
+	for user, _ := range s.userChans {
 		clients = append(clients, user)
 	}
-	userChans.RUnlock()
+	s.userChanLock.RUnlock()
 	return clients
 }
 
 //Send a message to all client channels specified in users
-func notifyMany(users []int, event ProtocolEvent) {
+func notifyMany(s Service, users []int, event ProtocolEvent) {
 	for _, user := range users {
-		notifyUser(user, event)
+		notifyUser(s, user, event)
 	}
 }
 
 //Send a message to a client channel, or silently ignore it if client doesn't exist
-func notifyUser(userId int, event ProtocolEvent) {
-	toChan := getUserChannel(userId)
+func notifyUser(s Service, userId int, event ProtocolEvent) {
+	toChan := getUserChannel(s, userId)
 	if toChan != nil {
 		toChan <- event
 	}
@@ -110,81 +94,80 @@ func getClientUser(c net.Conn) (int, error) {
 }
 
 //Handle an event as specified-- not threadsafe
-func handleEvent(event ProtocolEvent) {
-	log.Println(event.payload)
-
+func handleEvent(s Service, event ProtocolEvent) {
 	switch event.eventType {
 	case PrivateMsg:
-		notifyUser(event.toUserId, event)
+		notifyUser(s, event.toUserId, event)
 	case Follow:
-		FollowUser(event.fromUserId, event.toUserId)
-		notifyUser(event.toUserId, event)
+		FollowUser(s, event.fromUserId, event.toUserId)
+		notifyUser(s, event.toUserId, event)
 	case Unfollow:
-		UnfollowUser(event.fromUserId, event.toUserId)
+		UnfollowUser(s, event.fromUserId, event.toUserId)
 	case StatusUpdate:
-		notifyMany(GetFollowers(event.fromUserId), event)
+		notifyMany(s, GetFollowers(s, event.fromUserId), event)
 	case Broadcast:
-		notifyMany(getAllClients(), event)
+		notifyMany(s, getAllClients(s), event)
 	default:
-		log.Println("unable to handle" + event.payload)
+		log.Fatalf("unable to handle" + event.payload)
 	}
 }
 
 //Handle a stream of events from a connection-- must be single-threaded to order events
-func handleEventStream(c net.Conn, eventsDone chan bool) {
-	defer c.Close()
+func handleEventStream(s Service, c net.Conn) {
 	var (
 		err             error
 		eventPayload    string
-		event           ProtocolEvent
 		lastSequenceNum int       = 0
 		eventBuffer     EventHeap = make(EventHeap, 0)
 	)
-	eventReader := bufio.NewReader(c)
+	defer s.waitGroup.Done()
+	defer c.Close()
 
+	eventReader := bufio.NewReader(c)
 	heap.Init(&eventBuffer)
+	log.Printf("Event stream connected")
 
 	for {
 		if eventPayload, err = eventReader.ReadString('\n'); err != nil {
 			if err == io.EOF {
-				finish(eventsDone)
+				finishEvents(s)
 			} else {
 				log.Fatal(err)
 			}
 		}
-		if event, err = parseEventPayload(strings.TrimSpace(eventPayload)); err != nil {
+		if event, err := parseEventPayload(strings.TrimSpace(eventPayload)); err != nil {
 			log.Fatalf("Error parsing event: %s", err)
-		}
-
-		//process events so long as the next ones in sequenceNum order are available
-		heap.Push(&(eventBuffer), &event)
-		for len(eventBuffer) > 0 &&
-			eventBuffer[0].sequenceNum == lastSequenceNum+1 {
-			event = *(heap.Pop(&eventBuffer).(*ProtocolEvent))
-			handleEvent(event)
-			lastSequenceNum++
+		} else {
+			//process events so long as the next ones in sequenceNum order are available
+			heap.Push(&(eventBuffer), &event)
+			for len(eventBuffer) > 0 &&
+				eventBuffer[0].sequenceNum == lastSequenceNum+1 {
+				event = *(heap.Pop(&eventBuffer).(*ProtocolEvent))
+				handleEvent(s, event)
+				lastSequenceNum++
+			}
 		}
 	}
 }
 
 //Accept connections from a client, create their channels, and pass on notifications
-func handleClient(c net.Conn) {
-	defer c.Close()
+func handleClient(s Service, c net.Conn) {
 	var (
 		clientId int
 		err      error
 	)
+	defer s.waitGroup.Done()
+	defer c.Close()
 
 	if clientId, err = getClientUser(c); err != nil {
 		log.Fatal(err)
 	}
-	events := makeUserChannel(clientId)
+	events := makeUserChannel(s, clientId)
 	eventWriter := bufio.NewWriter(c)
 	log.Printf("Client %d waiting for notifications", clientId)
 
 	//wait for events until channel closes and write them to connection
 	for event := range events {
-		log.Printf("Sending %s to client %d", event.payload, clientId)
 		_, err := eventWriter.WriteString(event.ToWire())
 		if err != nil {
 			log.Fatal(err)
@@ -194,50 +177,89 @@ func handleClient(c net.Conn) {
 	runtime.Goexit()
 }
 
+//Service shared state
+type Service struct {
+	followers                    map[int](map[int]bool) //must be single-threaded
+	eventsDone                   chan bool
+	eventSrc, userClients        *net.TCPListener
+	eventsConn, clientConn       *net.TCPConn
+	eventSrcPort, userClientPort string
+	waitGroup                    *sync.WaitGroup
+	userChans                    map[int](chan ProtocolEvent)
+	userChanLock                 sync.RWMutex
+}
+
+//Initialize service state
+func MakeService(eventSrcPort string, userClientPort string) *Service {
+	s := &Service{
+		followers:      make(map[int](map[int]bool)),
+		eventsDone:     make(chan bool),
+		eventSrcPort:   eventSrcPort,
+		userClientPort: userClientPort,
+		waitGroup:      &sync.WaitGroup{},
+		userChans:      make(map[int](chan ProtocolEvent)),
+		userChanLock:   sync.RWMutex{},
+	}
+	return s
+}
+
 //Main server function:
-//-Accept a single event source connection
-//-Accept many user client connections afterward
-func main() {
+//-Accept a single event source connection and handle
+//-Accept many user client connections afterward and handle
+func (s *Service) Serve() {
+	const host = "localhost"
 	var (
-		eventSrc, userClients  *net.TCPListener
-		eventsConn, clientConn *net.TCPConn
-		laddr                  *net.TCPAddr
-		eventsDone             chan bool = make(chan bool)
-		err                    error
+		laddr *net.TCPAddr
+		err   error
 	)
-	defer eventSrc.Close()
-	defer userClients.Close()
-	defer os.Exit(0)
+	defer s.waitGroup.Wait()
+	defer s.eventSrc.Close()
+	defer s.userClients.Close()
 
 	//Handle a single event source connection
-	if laddr, err = net.ResolveTCPAddr("tcp", host+eventSrcPort); err != nil {
+	if laddr, err = net.ResolveTCPAddr("tcp", host+s.eventSrcPort); err != nil {
 		log.Fatal(err)
 	}
-	if eventSrc, err = net.ListenTCP("tcp", laddr); err != nil {
+	if s.eventSrc, err = net.ListenTCP("tcp", laddr); err != nil {
 		log.Fatal(err)
 	}
-	if eventsConn, err = eventSrc.AcceptTCP(); err != nil {
+	if s.eventsConn, err = s.eventSrc.AcceptTCP(); err != nil {
 		log.Fatal(err)
 	}
-	go handleEventStream(eventsConn, eventsDone)
+	go handleEventStream(*s, s.eventsConn)
+	s.waitGroup.Add(1)
 
 	//Handle client connections
-	if laddr, err = net.ResolveTCPAddr("tcp", host+userClientPort); err != nil {
+	if laddr, err = net.ResolveTCPAddr("tcp", host+s.userClientPort); err != nil {
 		log.Fatal(err)
 	}
-	if userClients, err = net.ListenTCP("tcp", laddr); err != nil {
+	if s.userClients, err = net.ListenTCP("tcp", laddr); err != nil {
 		log.Fatal(err)
 	}
-	userClients.SetDeadline(time.Now().Add(time.Second))
+	//Have AcceptTCP time out every second so program may exit when events EOF is hit
+	s.userClients.SetDeadline(time.Now().Add(time.Second))
 	for {
 		select {
-		case <-eventsDone:
+		case <-s.eventsDone:
 			runtime.Goexit()
 		default:
-			if clientConn, err = userClients.AcceptTCP(); err != nil {
+			if s.clientConn, err = s.userClients.AcceptTCP(); err != nil {
 				continue
 			}
-			go handleClient(clientConn)
+			go handleClient(*s, s.clientConn)
+			s.waitGroup.Add(1)
 		}
 	}
+}
+
+func main() {
+	const (
+		eventSrcPort   = ":9090"
+		userClientPort = ":9099"
+	)
+	defer os.Exit(0)
+
+	s := MakeService(eventSrcPort, userClientPort)
+	s.Serve()
+
 }
