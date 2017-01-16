@@ -25,7 +25,11 @@ const (
 )
 
 func (event *ProtocolEvent) String() string {
-	return "payload=" + event.payload
+	return event.payload
+}
+
+func (event *ProtocolEvent) ToWire() string {
+	return event.payload + "\r\n"
 }
 
 //An EventHeap is a minheap of pointers to protocol events
@@ -47,10 +51,6 @@ func (h *EventHeap) Pop() interface{} {
 	x := old[n-1]
 	*h = old[0 : n-1]
 	return x
-}
-
-func (h *EventHeap) Peek() interface{} {
-	return (*h)[0]
 }
 
 //Parse an event payload into a struct, or return an error if

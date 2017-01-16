@@ -4,50 +4,67 @@ import (
 	"bufio"
 	"container/heap"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 )
 
-func main() {
-	log.SetOutput(os.Stdout)
+const (
+	eventSrcPort   = ":9090"
+	userClientPort = ":9099"
+	bufferSize     = 0
+)
 
-	eventSrc, err := net.Listen("tcp", ":9090")
-	userClients, err := net.Listen("tcp", ":9099")
+var (
+	done  chan bool = make(chan bool)
+	debug           = false
+)
+
+//Main server function:
+//-Accept a single event source connection
+//-Accept many user client connections afterward
+func main() {
+	//Handle a single event source connection
+	eventSrc, err := net.Listen("tcp", eventSrcPort)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	eventsConn, err := eventSrc.Accept()
 	if err != nil {
 		log.Println(err)
 	}
 	go handleEventStream(eventsConn)
+
+	//Handle client connections
+	userClients, err := net.Listen("tcp", userClientPort)
+	if err != nil {
+		log.Fatal(err)
+	}
 	for {
-		clientConn, err := userClients.Accept()
-		if err != nil {
-			log.Println(err)
-			continue
+		select {
+		case <-done:
+			break
+		default:
+			clientConn, err := userClients.Accept()
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			go handleClient(clientConn)
 		}
-		go handleClient(clientConn)
 	}
 }
 
+//Map of client IDs to ProtocolEvent channels
 var userChans = struct {
 	sync.RWMutex
 	m map[int](chan ProtocolEvent)
 }{m: map[int](chan ProtocolEvent){}}
 
-var followers = make(map[int](map[int]bool))
-
-var orderedEvents = struct {
-	sync.Mutex
-	h EventHeap
-}{h: make(EventHeap, 0)}
-
+//Get a channel from the channel map (threadsafe)
 func getUserChannel(user int) (userChan chan ProtocolEvent) {
 	userChans.RLock()
 	userChan = userChans.m[user]
@@ -55,11 +72,10 @@ func getUserChannel(user int) (userChan chan ProtocolEvent) {
 	return
 }
 
+//If the user-channel hasn't been created yet, create it (threadsafe)
 func makeUserChannel(user int) (userChan chan ProtocolEvent) {
-	const bufferSize = 0
 	userChan = getUserChannel(user)
 
-	//if the user-channel hasn't been created yet, initialize it
 	if userChan == nil {
 		userChans.Lock()
 		log.Printf("Creating channel for client %d", user)
@@ -72,56 +88,63 @@ func makeUserChannel(user int) (userChan chan ProtocolEvent) {
 	return
 }
 
+//Handle a stream of events from a connection-- must be single-threaded to order events
 func handleEventStream(c net.Conn) {
 	var (
-		eventPayload    string
-		lastSequenceNum int
 		err             error
+		eventPayload    string
+		lastSequenceNum int       = 0
+		orderedEvents   EventHeap = make(EventHeap, 0)
 	)
 	eventReader := bufio.NewReader(c)
-	lastSequenceNum = 0
 
-	orderedEvents.Lock()
-	heap.Init(&orderedEvents.h)
-	orderedEvents.Unlock()
+	heap.Init(&orderedEvents)
 
 	for {
 		if eventPayload, err = eventReader.ReadString('\n'); err != nil {
-			c.Close()
-			break
+			if err == io.EOF {
+				log.Printf("Event stream complete. Exiting.")
+				for _, userId := range getAllClients() {
+					close(getUserChannel(userId))
+				}
+				done <- true
+				break
+			} else {
+				log.Fatal(err)
+			}
 		}
 		if event, err := parseEventPayload(strings.TrimSpace(eventPayload)); err != nil {
 			log.Printf("Error parsing event: %s", err)
 		} else {
-			orderedEvents.Lock()
-			heap.Push(&(orderedEvents.h), &event)
+			heap.Push(&(orderedEvents), &event)
 			log.Printf("Received event: %d; Previously processed event: %d", event.sequenceNum, lastSequenceNum)
 
-			for len(orderedEvents.h) > 0 &&
-				orderedEvents.h[0].sequenceNum == lastSequenceNum+1 {
-				event = *(heap.Pop(&orderedEvents.h).(*ProtocolEvent))
+			for len(orderedEvents) > 0 &&
+				orderedEvents[0].sequenceNum == lastSequenceNum+1 {
+				event = *(heap.Pop(&orderedEvents).(*ProtocolEvent))
 				log.Printf("Processing event: %d", event.sequenceNum)
 				handleEvent(event)
 				lastSequenceNum++
 			}
-			orderedEvents.Unlock()
 		}
 	}
+	log.Printf("Event handler exiting")
 }
 
+//Handle an event as specified-- not threadsafe
 func handleEvent(event ProtocolEvent) {
 	log.Println(event.payload)
 
 	switch event.eventType {
 	case PrivateMsg:
-		notify(event.toUserId, event)
+		notifyUser(event.toUserId, event)
 	case Follow:
-		follow(event.fromUserId, event.toUserId)
-		notify(event.toUserId, event)
+		FollowUser(event.fromUserId, event.toUserId)
+		notifyUser(event.toUserId, event)
 	case Unfollow:
-		unfollow(event.fromUserId, event.toUserId)
+		UnfollowUser(event.fromUserId, event.toUserId)
 	case StatusUpdate:
-		notifyMany(getFollowers(event.fromUserId), event)
+		notifyMany(GetFollowers(event.fromUserId), event)
 	case Broadcast:
 		notifyMany(getAllClients(), event)
 	default:
@@ -129,6 +152,7 @@ func handleEvent(event ProtocolEvent) {
 	}
 }
 
+//Return a slice of all connected client IDs
 func getAllClients() []int {
 	userChans.RLock()
 	clients := make([]int, 0, len(userChans.m))
@@ -140,37 +164,15 @@ func getAllClients() []int {
 	return clients
 }
 
-func follow(fromUserId int, toUserId int) {
-	if followers[toUserId] == nil {
-		followers[toUserId] = make(map[int]bool)
-	}
-	followers[toUserId][fromUserId] = true
-	log.Printf("userId %d has followers %v", toUserId, followers[toUserId])
-}
-
-func unfollow(fromUserId int, toUserId int) {
-	if followers[toUserId] != nil {
-		delete(followers[toUserId], fromUserId)
-	}
-	log.Printf("userId %d has followers %v", toUserId, followers[toUserId])
-}
-
-func getFollowers(userId int) []int {
-	usersFollowers := make([]int, 0, len(followers[userId]))
-	for follower, _ := range followers[userId] {
-		usersFollowers = append(usersFollowers, follower)
-	}
-	log.Printf("userId %d has followers %v", userId, usersFollowers)
-	return usersFollowers
-}
-
+//Send a message to all client channels specified in users
 func notifyMany(users []int, event ProtocolEvent) {
 	for _, user := range users {
-		notify(user, event)
+		notifyUser(user, event)
 	}
 }
 
-func notify(userId int, event ProtocolEvent) {
+//Send a message to a client channel, or silently ignore it if client doesn't exist
+func notifyUser(userId int, event ProtocolEvent) {
 	toChan := getUserChannel(userId)
 	if toChan != nil {
 		log.Printf("Notifying user %d of event %#v", userId, event.payload)
@@ -180,6 +182,7 @@ func notify(userId int, event ProtocolEvent) {
 	}
 }
 
+//Accept a client connection and receive its UserID
 func getClientUser(c net.Conn) (int, error) {
 	var (
 		clientId int
@@ -197,6 +200,7 @@ func getClientUser(c net.Conn) (int, error) {
 	}
 }
 
+//Accept connections from a client, create their channels, and pass on notifications
 func handleClient(c net.Conn) {
 	var (
 		clientId int
@@ -204,24 +208,20 @@ func handleClient(c net.Conn) {
 	)
 
 	if clientId, err = getClientUser(c); err != nil {
-		log.Println(err)
-		c.Close()
-		return
+		log.Fatal(err)
 	}
 	events := makeUserChannel(clientId)
-	log.Printf("Client %d waiting for notifications", clientId)
 	eventWriter := bufio.NewWriter(c)
+	log.Printf("Client %d waiting for notifications", clientId)
 
-	for {
-		//wait for events on channel and write them
-		event := <-events
+	for event := range events {
+		//wait for events on channel and write them to connection
 		log.Printf("Sending %s to client %d", event.payload, clientId)
-		_, err := eventWriter.WriteString(event.payload + "\r\n")
+		_, err := eventWriter.WriteString(event.ToWire())
 		if err != nil {
-			log.Println(err)
-			c.Close()
-			break
+			log.Fatal(err)
 		}
 		eventWriter.Flush()
 	}
+	log.Printf("Client %d exiting", clientId)
 }
