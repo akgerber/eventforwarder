@@ -1,6 +1,5 @@
 package main
 
-//Follower map: maps from followee_id -> (follower_id -> true)
 //Not threadsafe
 
 //Have fromUserId follow toUserId
