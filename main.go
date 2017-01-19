@@ -16,7 +16,7 @@ import (
 )
 
 //Get a channel from the channel map (threadsafe)
-func getUserChannel(s Service, user int) (userChan chan ProtocolEvent) {
+func getUserChannel(s *Service, user int) (userChan chan ProtocolEvent) {
 	s.userChanLock.RLock()
 	userChan = s.userChans[user]
 	s.userChanLock.RUnlock()
@@ -24,7 +24,7 @@ func getUserChannel(s Service, user int) (userChan chan ProtocolEvent) {
 }
 
 //Notify other goroutines and exit
-func finishEvents(s Service) {
+func finishEvents(s *Service) {
 	log.Printf("Exiting-- EOF received from event source")
 	for _, userId := range getAllClients(s) {
 		close(getUserChannel(s, userId))
@@ -34,7 +34,7 @@ func finishEvents(s Service) {
 }
 
 //If the user-channel hasn't been created yet, create it (threadsafe)
-func makeUserChannel(s Service, user int) (userChan chan ProtocolEvent) {
+func makeUserChannel(s *Service, user int) (userChan chan ProtocolEvent) {
 	const bufferSize = 0
 	userChan = getUserChannel(s, user)
 
@@ -50,7 +50,7 @@ func makeUserChannel(s Service, user int) (userChan chan ProtocolEvent) {
 }
 
 //Return a slice of all connected client IDs
-func getAllClients(s Service) []int {
+func getAllClients(s *Service) []int {
 	s.userChanLock.RLock()
 	clients := make([]int, 0, len(s.userChans))
 	for user, _ := range s.userChans {
@@ -61,14 +61,14 @@ func getAllClients(s Service) []int {
 }
 
 //Send a message to all client channels specified in users
-func notifyMany(s Service, users []int, event ProtocolEvent) {
+func notifyMany(s *Service, users []int, event ProtocolEvent) {
 	for _, user := range users {
 		notifyUser(s, user, event)
 	}
 }
 
 //Send a message to a client channel, or silently ignore it if client doesn't exist
-func notifyUser(s Service, userId int, event ProtocolEvent) {
+func notifyUser(s *Service, userId int, event ProtocolEvent) {
 	toChan := getUserChannel(s, userId)
 	if toChan != nil {
 		toChan <- event
@@ -94,7 +94,7 @@ func getClientUser(c net.Conn) (int, error) {
 }
 
 //Handle an event as specified-- not threadsafe
-func handleEvent(s Service, event ProtocolEvent) {
+func handleEvent(s *Service, event ProtocolEvent) {
 	switch event.eventType {
 	case PrivateMsg:
 		notifyUser(s, event.toUserId, event)
@@ -113,7 +113,7 @@ func handleEvent(s Service, event ProtocolEvent) {
 }
 
 //Handle a stream of events from a connection-- must be single-threaded to order events
-func handleEventStream(s Service, c net.Conn) {
+func handleEventStream(s *Service, c net.Conn) {
 	var (
 		err             error
 		eventPayload    string
@@ -151,7 +151,7 @@ func handleEventStream(s Service, c net.Conn) {
 }
 
 //Accept connections from a client, create their channels, and pass on notifications
-func handleClient(s Service, c net.Conn) {
+func handleClient(s *Service, c net.Conn) {
 	var (
 		clientId int
 		err      error
@@ -226,7 +226,7 @@ func (s *Service) Serve() {
 	if s.eventsConn, err = s.eventSrc.AcceptTCP(); err != nil {
 		log.Fatal(err)
 	}
-	go handleEventStream(*s, s.eventsConn)
+	go handleEventStream(s, s.eventsConn)
 	s.waitGroup.Add(1)
 
 	//Handle client connections
@@ -246,7 +246,7 @@ func (s *Service) Serve() {
 			if s.clientConn, err = s.userClients.AcceptTCP(); err != nil {
 				continue
 			}
-			go handleClient(*s, s.clientConn)
+			go handleClient(s, s.clientConn)
 			s.waitGroup.Add(1)
 		}
 	}
