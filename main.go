@@ -26,7 +26,7 @@ func getUserChannel(s *Service, user int) (userChan chan ProtocolEvent) {
 //Notify other goroutines and exit
 func finishEvents(s *Service) {
 	log.Printf("Exiting-- EOF received from event source")
-	for _, userId := range getAllClients(s) {
+	for _, userId := range GetAllClients(s) {
 		close(getUserChannel(s, userId))
 	}
 	s.eventsDone <- true
@@ -50,7 +50,7 @@ func makeUserChannel(s *Service, user int) (userChan chan ProtocolEvent) {
 }
 
 //Return a slice of all connected client IDs
-func getAllClients(s *Service) []int {
+func GetAllClients(s *Service) []int {
 	s.userChanLock.RLock()
 	clients := make([]int, 0, len(s.userChans))
 	for user, _ := range s.userChans {
@@ -58,21 +58,6 @@ func getAllClients(s *Service) []int {
 	}
 	s.userChanLock.RUnlock()
 	return clients
-}
-
-//Send a message to all client channels specified in users
-func notifyMany(s *Service, users []int, event ProtocolEvent) {
-	for _, user := range users {
-		notifyUser(s, user, event)
-	}
-}
-
-//Send a message to a client channel, or silently ignore it if client doesn't exist
-func notifyUser(s *Service, userId int, event ProtocolEvent) {
-	toChan := getUserChannel(s, userId)
-	if toChan != nil {
-		toChan <- event
-	}
 }
 
 //Accept a client connection and receive its UserID
@@ -90,25 +75,6 @@ func getClientUser(c net.Conn) (int, error) {
 		return 0, fmt.Errorf("Channel ID is non-int:  %s", line)
 	} else {
 		return clientId, nil
-	}
-}
-
-//Handle an event as specified-- not threadsafe
-func handleEvent(s *Service, event ProtocolEvent) {
-	switch event.eventType {
-	case PrivateMsg:
-		notifyUser(s, event.toUserId, event)
-	case Follow:
-		FollowUser(s, event.fromUserId, event.toUserId)
-		notifyUser(s, event.toUserId, event)
-	case Unfollow:
-		UnfollowUser(s, event.fromUserId, event.toUserId)
-	case StatusUpdate:
-		notifyMany(s, GetFollowers(s, event.fromUserId), event)
-	case Broadcast:
-		notifyMany(s, getAllClients(s), event)
-	default:
-		log.Fatalf("unable to handle" + event.payload)
 	}
 }
 
@@ -143,7 +109,8 @@ func handleEventStream(s *Service, c net.Conn) {
 			for len(eventBuffer) > 0 &&
 				eventBuffer[0].sequenceNum == lastSequenceNum+1 {
 				event = *(heap.Pop(&eventBuffer).(*ProtocolEvent))
-				handleEvent(s, event)
+				event.mutate(s)
+				event.notify(s)
 				lastSequenceNum++
 			}
 		}

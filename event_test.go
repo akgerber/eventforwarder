@@ -14,6 +14,7 @@ func TestParseEventPayload(t *testing.T) {
 		"542532|B",
 		"634|S|32",
 		"64|P|32|59",
+		"67|H|32|5",
 	}
 	expectedEvents := []ProtocolEvent{
 		{payload: "666|F|60|50", eventType: Follow, sequenceNum: 666, fromUserId: 60, toUserId: 50},
@@ -21,6 +22,7 @@ func TestParseEventPayload(t *testing.T) {
 		{payload: "542532|B", eventType: Broadcast, sequenceNum: 542532},
 		{payload: "634|S|32", eventType: StatusUpdate, sequenceNum: 634, fromUserId: 32},
 		{payload: "64|P|32|59", eventType: PrivateMsg, sequenceNum: 64, fromUserId: 32, toUserId: 59},
+		{payload: "67|H|32|5", eventType: Search, sequenceNum: 67, fromUserId: 32, toUserId: 5},
 	}
 	badPayloads := []string{
 		"hey man",

@@ -2,17 +2,10 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 )
-
-type ProtocolEvent struct {
-	payload     string
-	sequenceNum int
-	eventType   EventType
-	fromUserId  int
-	toUserId    int
-}
 
 type EventType int
 
@@ -22,7 +15,22 @@ const (
 	Broadcast
 	PrivateMsg
 	StatusUpdate
+	Search
 )
+
+type ProtocolEvent struct {
+	payload     string
+	sequenceNum int
+	eventType   EventType
+	fromUserId  int
+	toUserId    int
+	toNotify    []int
+}
+
+type iEvent interface {
+	mutate(s *Service)
+	notify(s *Service)
+}
 
 func (event *ProtocolEvent) String() string {
 	return event.payload
@@ -50,6 +58,36 @@ func (h *EventHeap) Pop() interface{} {
 	x := old[n-1]
 	*h = old[0 : n-1]
 	return x
+}
+
+//Handle an event as specified-- not threadsafe
+func (event *ProtocolEvent) mutate(s *Service) {
+	switch event.eventType {
+	case PrivateMsg:
+		event.toNotify = []int{event.toUserId}
+	case Follow:
+		FollowUser(s, event.fromUserId, event.toUserId)
+		event.toNotify = []int{event.toUserId}
+	case Unfollow:
+		UnfollowUser(s, event.fromUserId, event.toUserId)
+		event.toNotify = []int{}
+	case StatusUpdate:
+		event.toNotify = GetFollowers(s, event.fromUserId)
+	case Broadcast:
+		event.toNotify = GetAllClients(s)
+	default:
+		log.Fatalf("unable to handle" + event.payload)
+	}
+}
+
+//Send a message to all client channels specified in users
+func (event *ProtocolEvent) notify(s *Service) {
+	for _, userId := range event.toNotify {
+		toChan := getUserChannel(s, userId)
+		if toChan != nil {
+			toChan <- *event
+		}
+	}
 }
 
 //Parse an event payload into a struct, or return an error if
@@ -96,6 +134,9 @@ func parseEventPayload(payload string) (ProtocolEvent, error) {
 	case "B":
 		event.eventType = Broadcast
 		expectedPayloadSize = 2
+	case "H":
+		event.eventType = Search
+		expectedPayloadSize = 4
 	default:
 		return event, fmt.Errorf("User event type invalid in payload %s", payload)
 	}
@@ -103,7 +144,7 @@ func parseEventPayload(payload string) (ProtocolEvent, error) {
 		return event, fmt.Errorf("Invalid number of fields in payload %s", payload)
 	}
 	switch event.eventType {
-	case Follow, Unfollow, PrivateMsg:
+	case Follow, Unfollow, PrivateMsg, Search:
 		if toUserId, err := strconv.Atoi(splitPayload[3]); err != nil {
 			return event, fmt.Errorf("To User ID is non-int in payload  %s", payload)
 		} else {
